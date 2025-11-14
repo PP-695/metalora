@@ -123,7 +123,22 @@ class Trainer:
         """Explicit initialization method to be called after constructor"""
         self.build_data_loader()
         self.build_model()
+        # Initialize evaluator after class splits computed
         self.evaluator = Evaluator(self.cfg, self.many_idxs, self.med_idxs, self.few_idxs)
+
+        # Initialize class-aware modules from dataset imbalance if enabled
+        if getattr(self.cfg, "use_class_aware", False) and self.tuner is not None and hasattr(self, "cls_num_list"):
+            for module in self.tuner.modules():
+                if hasattr(module, "initialize_from_imbalance"):
+                    module.initialize_from_imbalance(
+                        self.cls_num_list,
+                        head_threshold=self.cfg.head_threshold,
+                        tail_threshold=self.cfg.tail_threshold,
+                        head_rank_factor=self.cfg.head_rank_factor,
+                        tail_rank_factor=self.cfg.tail_rank_factor,
+                        head_alpha_factor=self.cfg.head_alpha_factor,
+                        tail_alpha_factor=self.cfg.tail_alpha_factor,
+                    )
 
         if not self.debug_mode and self.is_main_process:
             writer_dir = os.path.join(self.cfg.output_dir, "tensorboard")
@@ -214,6 +229,19 @@ class Trainer:
 
         self.num_classes = train_dataset.num_classes
         self.cls_num_list = train_dataset.cls_num_list
+                # After setting self.cls_num_list
+        if self.cfg.use_class_aware and self.tuner is not None:
+            for module in self.tuner.modules():
+                if hasattr(module, "initialize_from_imbalance"):
+                    module.initialize_from_imbalance(
+                        self.cls_num_list,
+                        head_threshold=self.cfg.head_threshold,
+                        tail_threshold=self.cfg.tail_threshold,
+                        head_rank_factor=self.cfg.head_rank_factor,
+                        tail_rank_factor=self.cfg.tail_rank_factor,
+                        head_alpha_factor=self.cfg.head_alpha_factor,
+                        tail_alpha_factor=self.cfg.tail_alpha_factor,
+                    )
         self.classnames = train_dataset.classnames
 
         if "DOTA" in cfg.dataset or "FUSRS" in cfg.dataset:
@@ -352,9 +380,11 @@ class Trainer:
             torch.cuda.empty_cache()
 
         # 5. Final model setup
-        if self.world_size > 1:
+        if self.world_size > 1 and dist.is_initialized():
             self.model = nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
-        self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
+            self.model = DDP(self.model, device_ids=[self.local_rank], find_unused_parameters=True)
+        else:
+            print("DDP disabled: using single GPU/CPU")
 
     def build_optimizer(self):
         logger.section("Building Optimizer")

@@ -59,6 +59,8 @@ class ClassAwareMetaTrainer(MetaTrainer):
         
         # Track metrics history for visualization
         self.metrics_history = defaultdict(list)
+        if not hasattr(self, 'tuner'):
+            self.tuner = None
     
     def initialize(self):
         """Override initialization to add class distribution analysis"""

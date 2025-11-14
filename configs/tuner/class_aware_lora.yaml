@@ -7,6 +7,8 @@ use_class_aware: True
 
 flora:
   arch:
+    modules: ["q", "k", "v", "out", "mlp1", "mlp2"]
+    layers: [0,1,2,3,4,5,6,7,8,9,10,11]
     alpha: 1.0
     rank: 8  # Base rank
 
@@ -14,15 +16,15 @@ flora:
 class_aware:
   num_class_groups: 3  # head, medium, tail
   class_grouping_strategy: "threshold"  # or "frequency"
-  
+
   # Thresholds for grouping (used with threshold strategy)
   head_threshold: 100  # Classes with >= 100 samples
   tail_threshold: 20   # Classes with < 20 samples
-  
+
   # Initial rank factors per group
   head_rank_factor: 0.5   # Head classes use lower rank (less adaptation needed)
   tail_rank_factor: 2.0   # Tail classes use higher rank (more adaptation needed)
-  
+
   # Initial alpha factors per group
   head_alpha_factor: 0.5  # Head classes use lower alpha
   tail_alpha_factor: 2.0  # Tail classes use higher alpha

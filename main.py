@@ -140,15 +140,29 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Initialize distributed training
-    dist.init_process_group(backend="nccl")
-    local_rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
+    # Robust distributed init: use NCCL only when truly in multi-process mode.
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    use_ddp = world_size_env > 1
 
-    if local_rank == 0:
-        print(f"Training on {world_size} GPU(s)")
+    if use_ddp:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        local_rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        if local_rank == 0:
+            print(f"Training on {world_size} GPU(s)")
+            print("Loading configuration files")
+    else:
+        # Single-process path (Colab / 1 GPU)
+        local_rank = 0
+        world_size = 1
+        if torch.cuda.is_available():
+            torch.cuda.set_device(0)
+            device = torch.device("cuda", 0)
+        else:
+            device = torch.device("cpu")
+        print("Running in single-process (no DDP) mode")
         print("Loading configuration files")
 
     # Convert base config to OmegaConf
@@ -208,8 +222,9 @@ if __name__ == "__main__":
         print(f"Using output dir: {cfg.output_dir}")
         os.makedirs(cfg.output_dir, exist_ok=True)
 
-    dist.barrier()
-    if local_rank == 0:
-        print(">>>>> All Distributed GPUs initialized <<<<<")
+    if use_ddp:
+        dist.barrier()
+        if local_rank == 0:
+            print(">>>>> All Distributed GPUs initialized <<<<<")
 
     main(cfg, device)
