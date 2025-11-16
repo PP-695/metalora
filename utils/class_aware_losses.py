@@ -297,3 +297,236 @@ class ClassAwareFocalLoss(nn.Module):
         if self.class_gamma is not None:
             return [self.class_gamma]
         return []
+
+
+class OutlierClassLoss(nn.Module):
+    """
+    Outlier Class Learning (OCL) loss for OOD detection.
+    
+    Supports an auxiliary OOD dataset with an explicit outlier class
+    appended to the in-distribution classes. The last logit index is
+    reserved for the outlier class.
+    
+    Args:
+        num_id_classes: Number of in-distribution classes
+        weight: Optional weight for the OOD samples
+    """
+    
+    def __init__(self, num_id_classes: int, weight: float = 1.0):
+        super().__init__()
+        self.num_id_classes = num_id_classes
+        self.weight = weight
+        # Outlier class index is num_id_classes (0-indexed)
+        self.outlier_class_idx = num_id_classes
+    
+    def forward(self, logits, labels, is_ood=None):
+        """
+        Forward pass for outlier class learning.
+        
+        Args:
+            logits: Model predictions (batch_size, num_classes + 1)
+                   Last index is outlier class logit
+            labels: Ground truth labels (batch_size,)
+                   For OOD samples, should be set to num_id_classes
+            is_ood: Optional boolean tensor (batch_size,) indicating OOD samples
+                   If None, infers from labels
+            
+        Returns:
+            Cross-entropy loss treating last class as outlier
+        """
+        if is_ood is None:
+            # Infer OOD samples from labels
+            is_ood = labels >= self.num_id_classes
+        
+        # Compute standard cross-entropy
+        loss = F.cross_entropy(logits, labels, reduction='none')
+        
+        # Apply weight to OOD samples if specified
+        if self.weight != 1.0:
+            weights = torch.where(is_ood, 
+                                torch.tensor(self.weight, device=loss.device), 
+                                torch.tensor(1.0, device=loss.device))
+            loss = loss * weights
+        
+        return loss.mean()
+
+
+class TailPrototypeLoss(nn.Module):
+    """
+    OOD-Aware Tail Prototype Learning loss.
+    
+    Contrasts tail class features with OOD features to push tail representations
+    away from OOD distribution. Uses contrastive learning approach.
+    
+    Args:
+        temperature: Temperature for contrastive loss (default: 0.07)
+        margin: Margin for pushing tail away from OOD (default: 0.0)
+    """
+    
+    def __init__(self, temperature: float = 0.07, margin: float = 0.0):
+        super().__init__()
+        self.temperature = temperature
+        self.margin = margin
+    
+    def forward(self, features_tail, features_ood, labels_tail=None):
+        """
+        Compute contrastive loss between tail and OOD features.
+        
+        Args:
+            features_tail: Features from tail class samples (N_tail, D)
+            features_ood: Features from OOD samples (N_ood, D)
+            labels_tail: Optional labels for tail samples (N_tail,)
+            
+        Returns:
+            Contrastive loss pushing tail away from OOD
+        """
+        # Normalize features
+        features_tail = F.normalize(features_tail, dim=1)
+        features_ood = F.normalize(features_ood, dim=1)
+        
+        # Compute similarity matrix: (N_tail, N_ood)
+        similarity = torch.matmul(features_tail, features_ood.t()) / self.temperature
+        
+        # We want to minimize similarity (push tail away from OOD)
+        # Use negative of similarity as logits for a "repulsion" objective
+        # Create labels where all OOD samples should have low similarity
+        
+        # Simple approach: minimize max similarity to any OOD sample
+        max_similarity = similarity.max(dim=1)[0]  # (N_tail,)
+        
+        # Apply margin and compute loss
+        loss = F.relu(max_similarity - self.margin)
+        
+        return loss.mean()
+    
+    def forward_with_prototypes(self, features_tail, features_ood, labels_tail):
+        """
+        Alternative: Use per-class prototypes for tail classes.
+        
+        Args:
+            features_tail: Features from tail class samples (N_tail, D)
+            features_ood: Features from OOD samples (N_ood, D)
+            labels_tail: Labels for tail samples (N_tail,)
+            
+        Returns:
+            Prototype-based contrastive loss
+        """
+        # Normalize features
+        features_tail = F.normalize(features_tail, dim=1)
+        features_ood = F.normalize(features_ood, dim=1)
+        
+        # Compute per-class prototypes for tail
+        unique_labels = torch.unique(labels_tail)
+        prototypes = []
+        
+        for label in unique_labels:
+            mask = labels_tail == label
+            if mask.sum() > 0:
+                proto = features_tail[mask].mean(dim=0)
+                prototypes.append(F.normalize(proto.unsqueeze(0), dim=1))
+        
+        if len(prototypes) == 0:
+            return torch.tensor(0.0, device=features_tail.device)
+        
+        prototypes = torch.cat(prototypes, dim=0)  # (num_tail_classes, D)
+        
+        # Compute similarity between prototypes and OOD features
+        similarity = torch.matmul(prototypes, features_ood.t()) / self.temperature
+        
+        # Minimize max similarity
+        max_similarity = similarity.max(dim=1)[0]  # (num_tail_classes,)
+        loss = F.relu(max_similarity - self.margin)
+        
+        return loss.mean()
+
+
+def calibrate_logits(logits, class_priors, tau: float = 1.0):
+    """
+    Calibrated Logit Adjustment for inference.
+    
+    Adjusts logits based on class priors to correct for class imbalance.
+    This is typically applied at test time.
+    
+    Args:
+        logits: Model predictions (batch_size, num_classes)
+        class_priors: Prior probabilities for each class (num_classes,)
+                     Should sum to 1.0
+        tau: Temperature parameter controlling adjustment strength
+             tau=0 means no adjustment, tau=1 means full adjustment
+            
+    Returns:
+        Calibrated logits (batch_size, num_classes)
+    """
+    if tau == 0.0:
+        return logits
+    
+    # Ensure class_priors is on same device as logits
+    if not isinstance(class_priors, torch.Tensor):
+        class_priors = torch.tensor(class_priors, device=logits.device, dtype=logits.dtype)
+    else:
+        class_priors = class_priors.to(device=logits.device, dtype=logits.dtype)
+    
+    # Add small epsilon to avoid log(0)
+    eps = 1e-8
+    class_priors = torch.clamp(class_priors, min=eps)
+    
+    # Adjust logits by subtracting tau * log(prior)
+    adjustment = tau * torch.log(class_priors)
+    
+    return logits - adjustment.unsqueeze(0)
+
+
+class DebiasedHeadLoss(nn.Module):
+    """
+    Debiased loss for head classes to prevent over-confidence.
+    
+    Applies a penalty to head class predictions to reduce their dominance
+    and improve calibration for tail classes.
+    
+    Args:
+        cls_num_list: List/tensor of sample counts per class
+        head_threshold: Threshold for classifying as head class (default: 100)
+        penalty_weight: Weight for the debiasing penalty (default: 0.1)
+    """
+    
+    def __init__(self, cls_num_list, head_threshold: int = 100, penalty_weight: float = 0.1):
+        super().__init__()
+        cls_num_list = torch.tensor(cls_num_list, dtype=torch.float32)
+        
+        # Identify head classes
+        is_head = cls_num_list >= head_threshold
+        self.register_buffer('is_head', is_head)
+        self.penalty_weight = penalty_weight
+    
+    def forward(self, logits, target):
+        """
+        Compute debiased loss.
+        
+        Args:
+            logits: Model predictions (batch_size, num_classes)
+            target: Ground truth labels (batch_size,)
+            
+        Returns:
+            Cross-entropy with debiasing penalty
+        """
+        # Standard cross-entropy
+        ce_loss = F.cross_entropy(logits, target, reduction='none')
+        
+        # Compute penalty for over-confident head predictions
+        probs = F.softmax(logits, dim=1)
+        
+        # Get head class probabilities
+        head_probs = probs[:, self.is_head]  # (batch_size, num_head_classes)
+        
+        # Penalty: discourage high confidence on head classes
+        # Use entropy-based penalty (lower entropy = higher confidence)
+        head_entropy = -(head_probs * torch.log(head_probs + 1e-8)).sum(dim=1)
+        max_head_entropy = torch.log(torch.tensor(self.is_head.sum().float()))
+        
+        # Normalize and invert (high entropy = low penalty)
+        confidence_penalty = 1.0 - (head_entropy / (max_head_entropy + 1e-8))
+        
+        # Apply penalty
+        loss = ce_loss + self.penalty_weight * confidence_penalty
+        
+        return loss.mean()
