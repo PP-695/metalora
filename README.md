@@ -176,6 +176,119 @@ Enable meta-training by setting `use_meta=True`.
 
 ---
 
+## 🔬 Gap 10: Advanced Long-Tailed OOD Learning Features
+
+This implementation includes state-of-the-art extensions for long-tailed learning with OOD detection, building on the class-aware meta-learning framework.
+
+### COCL-Style Loss Components
+
+Three advanced loss components inspired by recent long-tailed OOD literature:
+
+1. **Outlier Class Learning (OCL)**: Explicitly models OOD samples with an auxiliary outlier class
+2. **Tail Prototype Learning**: Contrastive learning to push tail class representations away from OOD
+3. **Debiased Head Loss**: Reduces over-confidence in head classes for better calibration
+
+Enable in config:
+```yaml
+cocl:
+  use_ocl: True
+  use_tail_proto: True
+  use_head_debias: True
+  lambda_ocl: 0.5
+  lambda_tail_proto: 0.3
+  lambda_head_debias: 0.1
+```
+
+### EAT-Style Tail Augmentation
+
+CutMix-based augmentation focusing on tail classes:
+- Pastes tail patches into head or OOD images
+- Preserves tail class information with high beta parameter
+- Optional OOD-paste for additional diversity
+
+Enable in config:
+```yaml
+tail_augmentation:
+  use_tail_cutmix: True
+  tail_cutmix_alpha: 0.9999  # High value preserves tail
+  use_ood_paste: True
+```
+
+### OOD Detection Evaluation
+
+Comprehensive OOD detection metrics:
+- **AUROC**: Area Under ROC Curve
+- **AUPR**: Area Under Precision-Recall Curve
+- **FPR@95**: False Positive Rate at 95% TPR
+
+Supports multiple OOD benchmarks:
+- TinyImages (300K random images)
+- Places365 (scene images)
+- LSUN (large-scale scenes)
+- Textures (DTD)
+- SVHN (street view numbers)
+- Gaussian/Uniform noise
+
+Enable in config:
+```yaml
+ood_eval:
+  enable: True
+  ood_test_datasets: ["textures", "svhn", "lsun"]
+  ood_metric: "msp"  # or "energy", "odin"
+```
+
+### Advanced Visualizations
+
+Comprehensive analysis tools in `scripts/analyze_results.py`:
+
+1. **Confusion Matrix Heatmaps**: Per-class prediction errors
+2. **Per-Class Accuracy Plots**: Accuracy vs. sample count with head/medium/tail coloring
+3. **t-SNE Embeddings**: Feature space visualization with OOD samples
+4. **Calibration Curves**: Reliability diagrams per class group
+
+Generate visualizations:
+```bash
+python scripts/analyze_results.py \
+  --logits output/experiment/logits.npy \
+  --labels output/experiment/labels.npy \
+  --features output/experiment/features.npy \
+  --class-counts output/experiment/class_counts.npy \
+  --output-dir output/plots \
+  --save-confmat --save-per-class --save-calibration
+```
+
+### Logit Calibration
+
+Inference-time calibration for better uncertainty estimates:
+
+```yaml
+cocl:
+  use_logit_calibration: True
+  tau_calibrate: 1.0  # Calibration strength
+```
+
+### Full Gap 10 Example
+
+```bash
+python main.py \
+  --dataset cifar100_ir100 \
+  --model clip_vit_b16 \
+  --tuner class_aware_lora \
+  --opts \
+    use_meta=True \
+    use_class_aware=True \
+    cocl.use_ocl=True \
+    cocl.use_tail_proto=True \
+    cocl.use_head_debias=True \
+    tail_augmentation.use_tail_cutmix=True \
+    ood.use_ood=True \
+    ood.ood_dataset=tinyimages \
+    ood_eval.enable=True \
+    ood_eval.ood_test_datasets=[textures,svhn]
+```
+
+---
+
 ## ✍️ Citation
 
 If you find this work useful for your research, please consider citing our paper:
