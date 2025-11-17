@@ -3,11 +3,6 @@ Class-Aware Meta-Trainer for long-tailed learning with adaptive PEFT.
 
 This module extends MetaTrainer to optimize for balanced accuracy across
 class groups (head/medium/tail) and track class-specific performance.
-
-Gap 10 Extensions:
-- COCL-style loss components (OCL, tail prototype, head debias)
-- EAT-style tail augmentation with CutMix
-- OOD detection evaluation
 """
 
 import os
@@ -27,19 +22,6 @@ from utils.class_imbalance_utils import (
     compute_group_accuracy,
     visualize_class_distribution
 )
-from utils.class_aware_losses import (
-    OutlierClassLoss,
-    TailPrototypeLoss,
-    DebiasedHeadLoss,
-    calibrate_logits
-)
-from datasets.tail_augmentation import (
-    TailAugmentationMixer,
-    get_tail_mask,
-    get_head_mask
-)
-from datasets.ood_sampler import OODSampler
-from utils.ood_eval import evaluate_ood_detection, evaluate_multiple_ood_datasets, print_ood_metrics
 
 
 class ClassAwareMetaTrainer(MetaTrainer):
@@ -67,36 +49,6 @@ class ClassAwareMetaTrainer(MetaTrainer):
         self.rank_divergence_penalty = getattr(cfg, 'rank_divergence_penalty', 0.01)
         self.alpha_smoothness_penalty = getattr(cfg, 'alpha_smoothness_penalty', 0.005)
         
-        # Gap 10: COCL-style loss configuration
-        cocl_cfg = getattr(cfg, 'cocl', {})
-        self.use_ocl = cocl_cfg.get('use_ocl', False)
-        self.use_tail_proto = cocl_cfg.get('use_tail_proto', False)
-        self.use_head_debias = cocl_cfg.get('use_head_debias', False)
-        self.lambda_ocl = cocl_cfg.get('lambda_ocl', 0.5)
-        self.lambda_tail_proto = cocl_cfg.get('lambda_tail_proto', 0.3)
-        self.lambda_head_debias = cocl_cfg.get('lambda_head_debias', 0.1)
-        self.use_logit_calibration = cocl_cfg.get('use_logit_calibration', False)
-        self.tau_calibrate = cocl_cfg.get('tau_calibrate', 1.0)
-        
-        # Gap 10: Tail augmentation configuration
-        tail_aug_cfg = getattr(cfg, 'tail_augmentation', {})
-        self.use_tail_cutmix = tail_aug_cfg.get('use_tail_cutmix', False)
-        self.tail_cutmix_alpha = tail_aug_cfg.get('tail_cutmix_alpha', 0.9999)
-        self.tail_cutmix_prob = tail_aug_cfg.get('tail_cutmix_prob', 0.5)
-        self.use_ood_paste = tail_aug_cfg.get('use_ood_paste', False)
-        
-        # Gap 10: OOD configuration
-        ood_cfg = getattr(cfg, 'ood', {})
-        self.use_ood = ood_cfg.get('use_ood', False)
-        self.ood_dataset = ood_cfg.get('ood_dataset', '')
-        self.ood_data_path = ood_cfg.get('ood_data_path', './data')
-        
-        # Gap 10: OOD eval configuration
-        ood_eval_cfg = getattr(cfg, 'ood_eval', {})
-        self.enable_ood_eval = ood_eval_cfg.get('enable', False)
-        self.ood_test_datasets = ood_eval_cfg.get('ood_test_datasets', [])
-        self.ood_metric = ood_eval_cfg.get('ood_metric', 'msp')
-        
         # Initialize parent
         super().__init__(cfg, device)
         
@@ -104,14 +56,6 @@ class ClassAwareMetaTrainer(MetaTrainer):
         self.head_indices = None
         self.medium_indices = None
         self.tail_indices = None
-        
-        # Gap 10: Additional components (initialized later)
-        self.ocl_loss = None
-        self.tail_proto_loss = None
-        self.head_debias_loss = None
-        self.tail_augmenter = None
-        self.ood_sampler = None
-        self.ood_test_loaders = {}
         
         # Track metrics history for visualization
         self.metrics_history = defaultdict(list)
@@ -125,106 +69,6 @@ class ClassAwareMetaTrainer(MetaTrainer):
         if self.use_class_aware:
             self._analyze_class_distribution()
             self._initialize_class_aware_modules()
-            self._initialize_gap10_components()
-    
-    def _initialize_gap10_components(self):
-        """Initialize Gap 10 components (COCL losses, tail augmentation, OOD)."""
-        cls_num_list = np.array(self.cls_num_list)
-        
-        # 1. Initialize COCL-style losses
-        if self.use_ocl:
-            print("Initializing Outlier Class Learning loss...")
-            # OCL requires num_classes + 1 (last index for outlier class)
-            self.ocl_loss = OutlierClassLoss(
-                num_id_classes=self.num_classes,
-                weight=getattr(self.cfg, 'cocl', {}).get('ocl_weight', 1.0)
-            ).to(self.device)
-        
-        if self.use_tail_proto:
-            print("Initializing Tail Prototype Learning loss...")
-            cocl_cfg = getattr(self.cfg, 'cocl', {})
-            self.tail_proto_loss = TailPrototypeLoss(
-                temperature=cocl_cfg.get('tail_proto_temperature', 0.07),
-                margin=cocl_cfg.get('tail_proto_margin', 0.1)
-            ).to(self.device)
-        
-        if self.use_head_debias:
-            print("Initializing Debiased Head loss...")
-            head_threshold = getattr(self.cfg, 'head_threshold', 100)
-            self.head_debias_loss = DebiasedHeadLoss(
-                cls_num_list=cls_num_list,
-                head_threshold=head_threshold,
-                penalty_weight=getattr(self.cfg, 'cocl', {}).get('head_debias_penalty', 0.1)
-            ).to(self.device)
-        
-        # 2. Initialize tail augmentation
-        if self.use_tail_cutmix:
-            print("Initializing tail CutMix augmentation...")
-            self.tail_augmenter = TailAugmentationMixer(
-                alpha=self.tail_cutmix_alpha,
-                prob=self.tail_cutmix_prob,
-                use_ood=self.use_ood_paste
-            )
-        
-        # 3. Initialize OOD sampler
-        if self.use_ood and self.ood_dataset:
-            print(f"Initializing OOD sampler with dataset: {self.ood_dataset}...")
-            try:
-                # Get transform from train loader if available
-                transform = None
-                if hasattr(self, 'train_loader') and hasattr(self.train_loader.dataset, 'transform'):
-                    transform = self.train_loader.dataset.transform
-                
-                ood_cfg = getattr(self.cfg, 'ood', {})
-                self.ood_sampler = OODSampler(
-                    ood_dataset=self.ood_dataset,
-                    data_path=self.ood_data_path,
-                    batch_size=ood_cfg.get('ood_batch_size', 32),
-                    transform=transform,
-                    num_samples=ood_cfg.get('ood_num_samples', 0),
-                    num_workers=4
-                )
-                
-                # Pre-fill OOD buffer for augmentation if needed
-                if self.tail_augmenter is not None and self.use_ood_paste:
-                    print("Filling OOD buffer for tail augmentation...")
-                    ood_buffer = self.ood_sampler.get_buffer(buffer_size=256)
-                    self.tail_augmenter.set_ood_buffer(ood_buffer.to(self.device))
-                    
-            except Exception as e:
-                print(f"Warning: Failed to initialize OOD sampler: {e}")
-                print("Continuing without OOD data...")
-                self.use_ood = False
-                self.ood_sampler = None
-        
-        # 4. Initialize OOD evaluation datasets
-        if self.enable_ood_eval and len(self.ood_test_datasets) > 0:
-            print("Initializing OOD evaluation datasets...")
-            self._initialize_ood_eval_loaders()
-    
-    def _initialize_ood_eval_loaders(self):
-        """Initialize data loaders for OOD evaluation datasets."""
-        from torch.utils.data import DataLoader
-        
-        # Get transform from test loader
-        transform = None
-        if hasattr(self, 'test_loader') and hasattr(self.test_loader.dataset, 'transform'):
-            transform = self.test_loader.dataset.transform
-        
-        for ood_name in self.ood_test_datasets:
-            try:
-                print(f"  Loading OOD test dataset: {ood_name}")
-                sampler = OODSampler(
-                    ood_dataset=ood_name,
-                    data_path=self.ood_data_path,
-                    batch_size=self.cfg.test_batch_size if hasattr(self.cfg, 'test_batch_size') else 64,
-                    transform=transform,
-                    num_samples=0,  # Use all samples for eval
-                    num_workers=4
-                )
-                self.ood_test_loaders[ood_name] = sampler.loader
-            except Exception as e:
-                print(f"  Warning: Failed to load OOD dataset {ood_name}: {e}")
     
     def _analyze_class_distribution(self):
         """
@@ -400,7 +244,7 @@ class ClassAwareMetaTrainer(MetaTrainer):
     
     def _compute_class_aware_loss(self, outputs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """
-        Compute loss with class-aware weighting and Gap 10 components.
+        Compute loss with class-aware weighting.
         
         Args:
             outputs: Model predictions (batch_size, num_classes)
@@ -413,113 +257,24 @@ class ClassAwareMetaTrainer(MetaTrainer):
         base_loss = self.criterion(outputs, labels)
         
         if not self.focus_on_tail:
-            total_loss = base_loss
-        else:
-            # Add tail class weighting
-            # Create per-sample weights based on class group
-            weights = torch.ones_like(labels, dtype=torch.float32)
-            
-            if self.tail_indices is not None and len(self.tail_indices) > 0:
-                tail_mask = torch.isin(labels, torch.tensor(self.tail_indices, device=labels.device))
-                weights[tail_mask] = self.tail_loss_weight
-            
-            # Compute weighted loss
-            per_sample_loss = F.cross_entropy(outputs, labels, reduction='none')
-            weighted_loss = (per_sample_loss * weights).mean()
-            total_loss = weighted_loss
+            return base_loss
         
-        # Add Gap 10: COCL-style losses
-        gap10_loss = self._compute_gap10_losses(outputs, labels)
-        total_loss = total_loss + gap10_loss
+        # Add tail class weighting
+        # Create per-sample weights based on class group
+        weights = torch.ones_like(labels, dtype=torch.float32)
+        
+        if self.tail_indices is not None and len(self.tail_indices) > 0:
+            tail_mask = torch.isin(labels, torch.tensor(self.tail_indices, device=labels.device))
+            weights[tail_mask] = self.tail_loss_weight
+        
+        # Compute weighted loss
+        per_sample_loss = F.cross_entropy(outputs, labels, reduction='none')
+        weighted_loss = (per_sample_loss * weights).mean()
         
         # Add regularization if using class-aware parameters
         reg_loss = self._compute_regularization_loss()
         
-        return total_loss + reg_loss
-    
-    def _compute_gap10_losses(
-        self, 
-        outputs: torch.Tensor, 
-        labels: torch.Tensor,
-        features: Optional[torch.Tensor] = None,
-        ood_images: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Compute Gap 10 loss components (OCL, tail prototype, head debias).
-        
-        Args:
-            outputs: Model predictions (batch_size, num_classes)
-            labels: Ground truth labels (batch_size,)
-            features: Optional feature embeddings (batch_size, feature_dim)
-            ood_images: Optional OOD images for OCL
-            
-        Returns:
-            Combined Gap 10 loss
-        """
-        gap10_loss = 0.0
-        
-        # 1. Head debiasing loss (always applied to ID data)
-        if self.use_head_debias and self.head_debias_loss is not None:
-            head_debias = self.head_debias_loss(outputs, labels)
-            gap10_loss += self.lambda_head_debias * head_debias
-        
-        # 2. Tail prototype loss (requires features)
-        if self.use_tail_proto and self.tail_proto_loss is not None and features is not None:
-            # Get tail samples
-            if self.tail_indices is not None and len(self.tail_indices) > 0:
-                tail_mask = torch.isin(labels, torch.tensor(self.tail_indices, device=labels.device))
-                if tail_mask.sum() > 0:
-                    tail_features = features[tail_mask]
-                    tail_labels = labels[tail_mask]
-                    
-                    # Get OOD features if available
-                    if ood_images is not None and self.ood_sampler is not None:
-                        # Extract OOD features
-                        with torch.no_grad():
-                            ood_features = self._extract_features(ood_images)
-                        
-                        # Compute tail prototype loss
-                        tail_proto = self.tail_proto_loss(tail_features, ood_features, tail_labels)
-                        gap10_loss += self.lambda_tail_proto * tail_proto
-        
-        # 3. OCL loss (requires OOD data and model with outlier class)
-        if self.use_ocl and self.ocl_loss is not None and ood_images is not None:
-            # Forward pass on OOD data with outlier class logit
-            ood_outputs = self.model(ood_images)
-            
-            # Create labels for OOD (set to outlier class index)
-            ood_labels = torch.full((ood_images.size(0),), 
-                                   self.num_classes,  # Outlier class index
-                                   dtype=torch.long,
-                                   device=ood_images.device)
-            
-            # Compute OCL loss
-            ocl = self.ocl_loss(ood_outputs, ood_labels, is_ood=None)
-            gap10_loss += self.lambda_ocl * ocl
-        
-        return gap10_loss
-    
-    def _extract_features(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Extract feature embeddings from images.
-        
-        Args:
-            images: Input images (batch_size, C, H, W)
-            
-        Returns:
-            Feature embeddings (batch_size, feature_dim)
-        """
-        # This assumes model has a feature extraction method
-        # Adapt based on actual model architecture
-        if hasattr(self.model, 'extract_features'):
-            return self.model.extract_features(images)
-        elif hasattr(self.model, 'encode_image'):
-            # For CLIP-like models
-            return self.model.encode_image(images)
-        else:
-            # Fallback: use penultimate layer
-            # This may need to be customized based on model architecture
-            return self.model(images)  # Return logits as features for now
+        return weighted_loss + reg_loss
     
     def _compute_regularization_loss(self) -> torch.Tensor:
         """
@@ -667,7 +422,7 @@ class ClassAwareMetaTrainer(MetaTrainer):
     
     def test(self, split="test"):
         """
-        Override test to include class-aware metrics and OOD evaluation.
+        Override test to include class-aware metrics.
         """
         # Run standard test
         result = super().test(split)
@@ -689,64 +444,4 @@ class ClassAwareMetaTrainer(MetaTrainer):
                             print(f"    Rank weight: {group_stats['mean_rank_weight']:.3f} ± {group_stats['std_rank_weight']:.3f}")
                             print(f"    Alpha weight: {group_stats['mean_alpha_weight']:.3f} ± {group_stats['std_alpha_weight']:.3f}")
         
-        # Gap 10: OOD Detection Evaluation
-        if self.enable_ood_eval and len(self.ood_test_loaders) > 0 and self.is_main_process:
-            print("\n" + "="*80)
-            print("OOD Detection Evaluation")
-            print("="*80)
-            
-            try:
-                # Get ID test loader
-                id_loader = self.test_loader if hasattr(self, 'test_loader') else None
-                
-                if id_loader is not None:
-                    # Evaluate on each OOD dataset
-                    ood_results = evaluate_multiple_ood_datasets(
-                        model=self.model,
-                        id_loader=id_loader,
-                        ood_loaders=self.ood_test_loaders,
-                        device=self.device,
-                        score_type=self.ood_metric,
-                        temperature=1.0
-                    )
-                    
-                    # Print results
-                    for ood_name, metrics in ood_results.items():
-                        print_ood_metrics(metrics, ood_name)
-                    
-                    # Save results
-                    if hasattr(self.cfg, 'output_dir'):
-                        import json
-                        results_path = os.path.join(self.cfg.output_dir, 'ood_detection_results.json')
-                        with open(results_path, 'w') as f:
-                            json.dump(ood_results, f, indent=2)
-                        print(f"OOD detection results saved to {results_path}")
-                else:
-                    print("Warning: No test loader available for OOD evaluation")
-                    
-            except Exception as e:
-                print(f"Warning: OOD evaluation failed: {e}")
-                import traceback
-                traceback.print_exc()
-        
         return result
-    
-    def _apply_logit_calibration(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        Apply calibrated logit adjustment at inference time.
-        
-        Args:
-            logits: Model predictions (batch_size, num_classes)
-            
-        Returns:
-            Calibrated logits
-        """
-        if not self.use_logit_calibration or self.tau_calibrate == 0.0:
-            return logits
-        
-        # Compute class priors from training distribution
-        cls_num_list = np.array(self.cls_num_list)
-        class_priors = cls_num_list / cls_num_list.sum()
-        
-        # Apply calibration
-        return calibrate_logits(logits, class_priors, self.tau_calibrate)
